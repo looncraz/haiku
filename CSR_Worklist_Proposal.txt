@@ -1,0 +1,122 @@
+Projected Worklist: Possible Compositing Design with Client Side Rendering
+
+Phase 1: (Enabled client access to raw drawing code)
+* Identify movable drawing code from app_server to client
+ - Painter, DrawingEngine, drawing/*, modes, etc...
+* Move into private drawing kit into libbe.so
+* Verify normal functionality of app_server and test_app_server
+
+Phase 2: (Procedural Groundwork)
+* Establish app_server procedure for clients to request BBitmap of back buffer and front buffer as shared area.
+ - Must include synchronization protocol (Sync())
+ - Multiple clients must be able to render concurrently
+ - Clients responsible for not violating drawing regions.
+
+* Establish app_server procedure for clients to establish compositable buffer (BCanvas & BCanvasBuffer)
+ - BCanvas will have a server-side thread (ServerCanvas? Augment existing Canvas?) which will handle
+		protocol as well as updating the frame buffer using the CanvasBuffer
+ - Buffer for a window must provide for decorator provisioning (as required for loaded decorator)
+ - Buffer should provide provisioning for resizing of contents only if resizing is possible.
+ - No alpha blending, but zero alpha is used for masking outside of client area.
+ - Create BCanvas mode to enable shaping and transparency for client area,
+	Top view then invalidates with rgba(0,0,0,0), child views must use proper alpha drawing modes.
+ ... no dedicated buffer, no transparency... too expensive.
+
+Phase 3: (Client-side Abstraction of Drawing Logic)
+* Create BCanvas in interface kit
+ - represents drawing target used by BWindow, BBitmap, or even BView, takes over or exposes DrawingEngine
+ - Handles double buffering client-side, synchronization with app_server, and state (PushState() and PopState())
+ - Effectively emulates app_server connection for traditional or legacy applications.
+ - Creates list of draw calls and data, optionally renders immediately or upon Flush(), Sync(), etc.
+ - Draw call list not reset without Invalidate(), allowing caching of instructions even
+		without a buffer.  Must be optional - BCanvas flags?
+ - Hosts dedicated connection with app_server, each canvas can render indepedently
+   - Multiple BCanvas objects possible per window as child views may have a dedicated canvas.
+   ... this is to increase performance for applications which have two or more heavy drawing tasks
+   ... or just have a very heavy drawing task that might slow down a UI on slow machines
+   ... First place I envision using this is 'Chart'
+   ... Can allow normal UI widgets in one view and a direct-to-screen rendering in the adjacent view!
+* Create private BCanvasBuffer 
+ - represents connection to either screen or a bitmap with dedicated frame
+ - Resizable
+ - Hosts decorator when BWindow uses dedicated buffer (such as when compositing is active)
+ ... decorator can also choose to draw only to screen buffer, but performance may be hurt.
+* Create test application to verify functionality (likely a throw-away test app)
+... BCanvas should appear to be like a BView or BBitmap when used directly at this point.
+
+Phase 4: (Draw Redirection - Client Side Rendering Completed)
+* Give BWindow a BCanvas
+ - Each window has two app_server links - one for drawing and one for everything else
+ - BWindow's looper is still locked during drawing
+* Allow BView to have a dedicated BCanvas set. By default, it inherits from its parent or window.
+* Check sanity of offscreen BBitmap rendering (BBitmap with BView won't need a BWindow... just BCanvas)
+* Move MOST drawing functions to use BCanvas, implementing client-side rendering.
+ - Enable app_server to directly render BBitmaps using hardware acceleration, if available, otherwise
+		render with CPU from client.
+* Remove app_server drawing hooks, message support, etc...
+ - except accelerated BBitmap blitting, software cursor, and overlays.
+ - Leave in place existing code to enable rendering windows from bitmaps in phase 5.
+  ... Draw() invocations on exposure, visible region, etc... must remain.
+
+Phase 5: (Buffered drawing)
+* Move every BCanvasBuffer to using a dedicated bitmap (CanvasBuffer in app_server)
+ - Must be OPTIONAL!  Must monitor memory usage!
+ - Make dedicated buffer always optional for desktop, BDirectWindow, and BCanvas
+ ... very important for games, OpenGL, screen savers, etc...
+* Update app_server drawing to render the portion of a given window's buffer instead of invoking BView::Draw()
+* Server-side buffer links to BCanvasBuffer with dirty flag and flip flag (always points to BCanvas's front buffer).
+* Implement dynamic resizing logic
+* Implement full window update on client invalidation calls or when any drawing is performed and we don't have a known
+	update rect (NOTE: acquiring bounds for many drawing functions is possible and should be done on the client side
+		whenever possible... but that's an optimization best left for later)
+* Update decorator to draw into window buffers.
+... implement zero-alpha click pass-through (alpha mask) separately for decorator region and client content rect.
+... While we are using buffers, we are not yet compositing.  Existing drawing code is being used, no transparency
+... effects would work now as we are drawing portions of the client buffers.
+... performance will be subpar if continuing this render technique and trying to implement transparency or
+		shaped windows.  Single threads end up doing too much work while others do too little...
+
+Phase 6: (Compositing Testing Ground)
+* Create render-ordered list of compositable objects (buffer) in Desktop
+ - Multiple lists? One per workspace? Could be faster...
+ - Allow objects to dictate 8-bit z-index
+	0 - desktop
+	1 - normal windows (effective order comes from standard window list order - current ordering method)
+	64 - topmost windows (B_MODAL_ALL_WINDOW_FEEL)
+	100 - fullscreen (propose: B_FULLSCREEN_WINDOW type - automatically redirects around buffers)
+	128 - exclusive fullscreen - max accessible by normal windows (B_EXCLUSIVE_FULLSCREEN_WINDOW)
+	127 - Composited overlay (volume meter, )
+	252 - Screen-thief (screen savers, crash dialogs, mouse dragged bitmap)
+	255 - mouse
+	256 - kdl
+* Implement base for CompositEngine in app_server
+ - Engine manges list of compositors with dedicated threads and output buffer regions.
+ - Software cursor is implemented as compositable object with high priority and maximum z-index.
+ - Compositing occurs into dedicated buffer - a BBitmap that can be obtained by clients to be drawn.
+ - Compositors render into back buffer, buffer is flipped by engine after every update.
+ - Dirty region gets rebuilt from the desktop up (later to be optimized)
+* Implement test app which directly interfaces with app_server to composite regular drawing.
+ - Will supply multiple bitmaps that will move and be sorted as compositable objects
+
+Phase 7: (Compositing)
+* Make CanvasBuffer a proper compositable object
+ - Take into account window attributes
+* Augment compositable object with visible and obscurring regions.
+ - Use to know when foreground updates require backgroud redrawing.
+ - Updating obscurring region is going to be the time consuming part here - it must be perfect
+* Create CompositingHWInterface or modify existing AccelerantHWInterface
+ - Finally using screen buffer!
+ - Potential hardware acceleration for bitmap blitting.
+* Create CompositingViewHWInterface or modify existing ViewHWInterface
+ - For test_app_server
+* Intelligently divide screen, based on resolution and core count, between multiple compositors.
+* Send window dirty updates into CompositeEngine to create work queue
+* Make CompositeEngine track time between vblank to predict next vblank, to delay back to front flip if during screen update.
+* Create boot-time checks to intelligently enable compositing.
+	- RAM capacity, CPU core count, possible hardware instruction requirements (SSE likely required)
+	- Dynamically enable transparency support - slow hardware with plenty of RAM can still benefit from buffered rendering.
+
+Phase 8: (Optimization)
+* Implement dragged bitmaps as BCanvas (enabling potential hardware accleration)
+* Find true dirty region for drawing operations to limit redrawing necessary.
+* 
